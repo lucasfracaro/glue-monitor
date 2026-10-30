@@ -22,7 +22,7 @@ CENARIOS = [
     [("TIMEOUT", "erro_aws")],
     [("SUCCEEDED", "limpo"), ("SUCCEEDED", "limpo")],
     [("FAILED", "sem_mensagem")],                    # erro so no log
-    [("SUCCEEDED", "limpo")],
+    [("FAILED", "erro_aws"), ("SUCCEEDED", "erro"), ("SUCCEEDED", "limpo")],  # 3 tentativas
     [("STOPPED", "erro_aws")],
 ]
 

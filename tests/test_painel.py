@@ -59,10 +59,10 @@ def test_arquivo_invalido():
         raise AssertionError(f"deveria falhar: {texto}")
 
 
-def _avaliar(opcoes=None, erros=None, dia=ONTEM):
+def _avaliar(opcoes=None, erros=None, dia=ONTEM, todas=False):
     lista = nucleo.carregar_payloads((PASTA / "payloads.json").read_bytes(), "payloads.json")
     return lista, nucleo.executar_avaliacao(lista, "meu_job", dia, opcoes=opcoes, dicionario_erros=erros,
-                                            regiao="sa-east-1", simulado=True)
+                                            regiao="sa-east-1", simulado=True, todas_execucoes=todas)
 
 
 def test_uma_linha_por_carga_com_todos_os_resultados():
@@ -75,13 +75,13 @@ def test_uma_linha_por_carga_com_todos_os_resultados():
     sem = quadro[quadro["resultado_operacional"] == nucleo.SEM_EXECUCAO].iloc[0]
     assert sem["execucoes_no_dia"] == 0 and pd_isna(sem["job_run_id"])
     # 3 execucoes avulsas nao batem com nenhum payload
-    assert r["total_execucoes_dia"] == r["historico"].shape[0] + 3
+    assert r["total_execucoes_dia"] == r["execucoes"].shape[0] + 3
 
 
 def test_ultima_execucao_e_historico():
     _, r = _avaliar()
-    quadro, historico = r["quadro"], r["historico"]
-    reprocessada = quadro[quadro["execucoes_no_dia"] == 2]
+    quadro, historico = r["quadro"], r["execucoes"]
+    reprocessada = quadro[quadro["execucoes_no_dia"] >= 2]
     assert not reprocessada.empty
     for _, linha in reprocessada.iterrows():
         execs = historico[historico["name"] == linha["name"]].sort_values("started_on")
@@ -140,7 +140,43 @@ def test_modo_real_sem_execucoes_no_dia():
         nucleo.fg.boto3 = original
     assert chamadas == {"profile_name": "prd", "region_name": "sa-east-1"}
     assert list(r["quadro"]["resultado_operacional"]) == [nucleo.SEM_EXECUCAO]
-    assert r["total_execucoes_dia"] == 0 and r["historico"].empty
+    assert r["total_execucoes_dia"] == 0 and r["execucoes"].empty
+
+
+def test_todas_as_execucoes_do_dia():
+    _, ultima = _avaliar()
+    _, todas = _avaliar(todas=True)
+    ex_u, ex_t = ultima["execucoes"], todas["execucoes"]
+    # mesmas execucoes nas duas visoes; na visao "todas" cada uma tem resultado operacional
+    assert sorted(ex_u["job_run_id"]) == sorted(ex_t["job_run_id"])
+    assert ex_t["avaliada"].all() and ex_t["resultado_operacional"].notna().all()
+    assert ex_u["avaliada"].sum() == (ultima["quadro"]["resultado_operacional"] != nucleo.SEM_EXECUCAO).sum()
+    # a situacao atual de cada carga nao muda com a visao
+    cols = ["name", "resultado_operacional", "job_run_id", "execucoes_no_dia"]
+    pd_ = __import__("pandas")
+    pd_.testing.assert_frame_equal(ultima["quadro"][cols].reset_index(drop=True), todas["quadro"][cols].reset_index(drop=True))
+    # numeracao no dia e marcacao da atual
+    for nome, grupo in ex_t.groupby("name"):
+        grupo = grupo.sort_values("started_on")
+        assert list(grupo["ordem_no_dia"]) == list(range(1, len(grupo) + 1))
+        assert list(grupo["atual"]) == [False] * (len(grupo) - 1) + [True]
+    # carga com 3 tentativas: falha (AWS), falso positivo (log) e positivo
+    tres = ex_t[ex_t["total_no_dia"] == 3].sort_values("started_on")
+    assert list(tres["resultado_operacional"]) == ["FRACASSO", "FALSO_POSITIVO", "POSITIVO"]
+    linha = todas["quadro"][todas["quadro"]["name"] == tres.iloc[0]["name"]].iloc[0]
+    assert linha["historico_dia"] == "❌ 🟠 ✅"
+    linha_u = ultima["quadro"][ultima["quadro"]["name"] == tres.iloc[0]["name"]].iloc[0]
+    assert linha_u["historico_dia"] == "❌ ✅ ✅"  # anteriores so com estado AWS
+
+
+def test_duracao_em_andamento():
+    import pandas as pd
+
+    agora = pd.Timestamp("2026-10-30 10:30:00")
+    assert nucleo.duracao_execucao({"execution_time": 0, "started_on": pd.Timestamp("2026-10-30 10:00:00"),
+                                    "completed_on": pd.NaT}, agora) == "30m00s"
+    assert nucleo.duracao_execucao({"execution_time": 125.0}, agora) == "2m05s"
+    assert nucleo.duracao_execucao({"started_on": pd.NaT}, agora) == ""
 
 
 def test_link_console_e_duracao():

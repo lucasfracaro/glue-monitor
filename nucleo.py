@@ -183,8 +183,16 @@ def executar_avaliacao(
     perfil: str | None = None,
     regiao: str | None = None,
     simulado: bool = False,
+    todas_execucoes: bool = False,
 ) -> dict:
-    """Roda avaliar_job_glue_visual e devolve o quadro com uma linha por carga."""
+    """Roda avaliar_job_glue_visual e devolve:
+
+    quadro      uma linha por carga, com a ultima execucao do dia
+    execucoes   uma linha por execucao do dia que bateu com alguma carga. Com
+                todas_execucoes=True cada uma tem resultado_operacional (o log de
+                todas e lido); senao so a ultima de cada carga e avaliada e as
+                demais trazem apenas o estado da AWS.
+    """
     opcoes = dict(opcoes or {})
     if simulado:
         from simulador import boto3_simulado
@@ -200,22 +208,43 @@ def executar_avaliacao(
             nome_job=nome_job,
             data_referencia=data_referencia,
             lista_payloads=lista_payloads,
-            last_execution=True,
+            last_execution=not todas_execucoes,
             timezone=fuso,
             dicionario_erros=dicionario_erros,
             **opcoes,
         )
 
-    # todas as execucoes do dia que bateram com cada nome (sem nova chamada a AWS)
-    historico = fg.filtrar_execucoes_por_lista_payloads_nomeados(
-        df_execucoes=resultado["df_execucoes"],
-        lista_payloads=lista_payloads,
-        **{k: v for k, v in opcoes.items() if k in OPCOES_FILTRO},
-    )
-    quadro = montar_quadro(resultado, lista_payloads, historico, fuso, regiao, nome_job)
+    df_av = resultado.get("df_avaliacao_visual")
+    if df_av is None or df_av.empty:
+        df_av = resultado.get("df_avaliacao")
+    if df_av is None:
+        df_av = pd.DataFrame()
+
+    if todas_execucoes:
+        df_todas = df_av
+        df_ultimas = fg.manter_ultima_execucao_por_name(df_av) if not df_av.empty else df_av
+    else:
+        # demais execucoes do dia de cada carga, sem nova chamada a AWS
+        df_todas = fg.filtrar_execucoes_por_lista_payloads_nomeados(
+            df_execucoes=resultado["df_execucoes"],
+            lista_payloads=lista_payloads,
+            **{k: v for k, v in opcoes.items() if k in OPCOES_FILTRO},
+        )
+        if not df_todas.empty and not df_av.empty:
+            # a ultima de cada carga ja foi avaliada: usa a linha avaliada
+            avaliadas = set(zip(df_av["name"], df_av["job_run_id"]))
+            df_todas = pd.concat([
+                df_av,
+                df_todas[[(n, j) not in avaliadas for n, j in zip(df_todas["name"], df_todas["job_run_id"])]],
+            ], ignore_index=True)
+        df_ultimas = df_av
+
+    execucoes = montar_execucoes(df_todas, lista_payloads, fuso, regiao, nome_job)
+    quadro = montar_quadro(df_ultimas, lista_payloads, execucoes, fuso, regiao, nome_job)
     return {
         "quadro": quadro,
-        "historico": _historico_legivel(historico, fuso),
+        "execucoes": execucoes,
+        "todas_avaliadas": todas_execucoes,
         "resumo": resultado["resumo"],
         "total_execucoes_dia": len(resultado["df_execucoes"]),
     }
@@ -256,47 +285,92 @@ def _limpo(valor):
     return None if valor_vazio(valor) else valor
 
 
-def montar_quadro(resultado, lista_payloads, historico, fuso, regiao, nome_job) -> pd.DataFrame:
-    df_av = resultado.get("df_avaliacao_visual")
-    if df_av is None or df_av.empty:
-        df_av = resultado.get("df_avaliacao")
-    por_nome = {} if df_av is None or df_av.empty else {r["name"]: r for _, r in df_av.iterrows()}
-    contagem = {} if historico is None or historico.empty else historico["name"].value_counts().to_dict()
+def _campos_execucao(r, fuso, regiao, nome_job) -> dict:
+    """Campos de uma execucao (avaliada ou nao) vindos dos DataFrames de funcoes_glue."""
+    avaliada = not valor_vazio(r.get("resultado_operacional"))
+    # execucao nao avaliada: so o ErrorMessage da AWS
+    detalhe = _limpo(r.get("detalhe_erro")) if avaliada else _limpo(r.get("error_message"))
+    if detalhe is not None:
+        detalhe = fg.limpar_mensagem_log(detalhe)
+    return {
+        **_interpretar_erro(detalhe, nome_job),
+        "avaliada": avaliada,
+        "resultado_operacional": r.get("resultado_operacional") if avaliada else None,
+        "status_aws": _limpo(r.get("status")),
+        "status_operacional": _limpo(r.get("status_operacional")),
+        "started_on": _hora_local(r.get("started_on"), fuso),
+        "completed_on": _hora_local(r.get("completed_on"), fuso),
+        "execution_time": _limpo(r.get("execution_time")),
+        "detalhe_erro": detalhe,
+        "erro_categoria": _limpo(r.get("erro_categoria")),
+        "erro_resumido": _limpo(r.get("erro_resumido")),
+        "impacto_negocio": _limpo(r.get("impacto_negocio")),
+        "acao_sugerida": _limpo(r.get("acao_sugerida")),
+        "log_localizado": str(r.get("log_localizado")) == "True",
+        "qt_erros_log": _limpo(r.get("qt_erros_log")),
+        "qt_warnings_log": _limpo(r.get("qt_warnings_log")),
+        "job_run_id": _limpo(r.get("job_run_id")),
+        "filtros_aplicados": r.get("_filtros_aplicados"),
+        "filtros_ignorados": r.get("_filtros_ignorados"),
+        "link": link_console(regiao, nome_job, _limpo(r.get("job_run_id"))),
+    }
+
+
+COLUNAS_EXECUCOES = ["name", "job_run_id", "avaliada", "resultado_operacional", "status_aws", "started_on",
+                     "completed_on", "ordem_no_dia", "total_no_dia", "atual"]
+
+
+def montar_execucoes(df_todas, lista_payloads, fuso, regiao, nome_job) -> pd.DataFrame:
+    """Uma linha por (carga, execucao), com a posicao da execucao no dia."""
+    if df_todas is None or df_todas.empty:
+        return pd.DataFrame(columns=COLUNAS_EXECUCOES)
+    payloads = dict(lista_payloads)
+    ordem_arquivo = {nome: i for i, (nome, _) in enumerate(lista_payloads)}
+    linhas = [
+        {"name": r["name"], "payload": payloads.get(r["name"]), "_ordem_arquivo": ordem_arquivo.get(r["name"], 0),
+         **_campos_execucao(r, fuso, regiao, nome_job)}
+        for _, r in df_todas.iterrows()
+    ]
+    df = pd.DataFrame(linhas)
+    for coluna in ("started_on", "completed_on"):
+        df[coluna] = pd.to_datetime(df[coluna])
+    df = df.sort_values(["_ordem_arquivo", "started_on"]).reset_index(drop=True)
+    df["ordem_no_dia"] = df.groupby("name").cumcount() + 1
+    df["total_no_dia"] = df.groupby("name")["name"].transform("size")
+    df["atual"] = df["ordem_no_dia"] == df["total_no_dia"]
+    return df
+
+
+ICONES_AWS = {"SUCCEEDED": "✅", "STARTING": "🔄", "RUNNING": "🔄", "WAITING": "🔄", "STOPPING": "🔄"}
+
+
+def icone_execucao(linha) -> str:
+    """Icone do resultado operacional; sem avaliacao, do estado na AWS."""
+    if linha.get("avaliada"):
+        return RESULTADOS.get(linha.get("resultado_operacional"), RESULTADOS["INDETERMINADO"])[0]
+    return ICONES_AWS.get(linha.get("status_aws"), "❌")
+
+
+def montar_quadro(df_ultimas, lista_payloads, execucoes, fuso, regiao, nome_job) -> pd.DataFrame:
+    """Uma linha por carga do arquivo, com a ultima execucao do dia (ou SEM_EXECUCAO)."""
+    por_nome = {} if df_ultimas is None or df_ultimas.empty else {r["name"]: r for _, r in df_ultimas.iterrows()}
+    sequencia = {}
+    if execucoes is not None and not execucoes.empty:
+        for nome, grupo in execucoes.groupby("name", sort=False):
+            sequencia[nome] = (len(grupo), " ".join(icone_execucao(l) for l in grupo.to_dict("records")))
 
     linhas = []
     for ordem, (nome, payload) in enumerate(lista_payloads):
         r = por_nome.get(nome)
         if r is None:
             linhas.append({"name": nome, "resultado_operacional": SEM_EXECUCAO, "payload": payload,
-                           "execucoes_no_dia": 0, "_ordem_arquivo": ordem})
+                           "execucoes_no_dia": 0, "historico_dia": "", "_ordem_arquivo": ordem})
             continue
-        resultado_op = _limpo(r.get("resultado_operacional")) or "INDETERMINADO"
-        detalhe = _limpo(r.get("detalhe_erro"))
-        linhas.append({
-            **_interpretar_erro(detalhe, nome_job),
-            "name": nome,
-            "resultado_operacional": resultado_op,
-            "status_aws": _limpo(r.get("status")),
-            "status_operacional": _limpo(r.get("status_operacional")),
-            "started_on": _hora_local(r.get("started_on"), fuso),
-            "completed_on": _hora_local(r.get("completed_on"), fuso),
-            "execution_time": _limpo(r.get("execution_time")),
-            "detalhe_erro": _limpo(r.get("detalhe_erro")),
-            "erro_categoria": _limpo(r.get("erro_categoria")),
-            "erro_resumido": _limpo(r.get("erro_resumido")),
-            "impacto_negocio": _limpo(r.get("impacto_negocio")),
-            "acao_sugerida": _limpo(r.get("acao_sugerida")),
-            "log_localizado": bool(r.get("log_localizado")) if not valor_vazio(r.get("log_localizado")) else False,
-            "qt_erros_log": _limpo(r.get("qt_erros_log")),
-            "qt_warnings_log": _limpo(r.get("qt_warnings_log")),
-            "job_run_id": _limpo(r.get("job_run_id")),
-            "filtros_aplicados": r.get("_filtros_aplicados"),
-            "filtros_ignorados": r.get("_filtros_ignorados"),
-            "payload": payload,
-            "execucoes_no_dia": int(contagem.get(nome, 1)),
-            "link": link_console(regiao, nome_job, _limpo(r.get("job_run_id"))),
-            "_ordem_arquivo": ordem,
-        })
+        campos = _campos_execucao(r, fuso, regiao, nome_job)
+        campos["resultado_operacional"] = campos["resultado_operacional"] or "INDETERMINADO"
+        total, icones = sequencia.get(nome, (1, icone_execucao(campos)))
+        linhas.append({**campos, "name": nome, "payload": payload, "execucoes_no_dia": int(total),
+                       "historico_dia": icones, "_ordem_arquivo": ordem})
 
     quadro = pd.DataFrame(linhas)
     for coluna in ("started_on", "completed_on"):
@@ -306,17 +380,6 @@ def montar_quadro(resultado, lista_payloads, historico, fuso, regiao, nome_job) 
     quadro["_ordem_resultado"] = quadro["resultado_operacional"].map(
         lambda x: ORDEM_RESULTADOS.index(x) if x in ORDEM_RESULTADOS else 2)
     return quadro.sort_values(["_ordem_resultado", "_ordem_arquivo"]).reset_index(drop=True)
-
-
-def _historico_legivel(historico: pd.DataFrame, fuso: str) -> pd.DataFrame:
-    colunas = ["name", "job_run_id", "status", "started_on", "completed_on", "error_message"]
-    if historico is None or historico.empty:
-        return pd.DataFrame(columns=colunas)
-    df = historico[[c for c in colunas if c in historico.columns]].copy()
-    for coluna in ("started_on", "completed_on"):
-        if coluna in df:
-            df[coluna] = df[coluna].map(lambda v: _hora_local(v, fuso))
-    return df
 
 
 def resumo_por_resultado(quadro: pd.DataFrame) -> dict[str, int]:
@@ -331,3 +394,14 @@ def formatar_duracao(segundos) -> str:
     h, resto = divmod(segundos, 3600)
     m, s = divmod(resto, 60)
     return f"{h}h{m:02d}m" if h else f"{m}m{s:02d}s"
+
+
+def duracao_execucao(linha, agora: pd.Timestamp) -> str:
+    """Duracao informada pela AWS; em andamento, desde o inicio ate agora."""
+    tempo = linha.get("execution_time")
+    if not valor_vazio(tempo) and float(tempo) > 0:
+        return formatar_duracao(tempo)
+    inicio, fim = linha.get("started_on"), linha.get("completed_on")
+    if valor_vazio(inicio):
+        return ""
+    return formatar_duracao(((fim if not valor_vazio(fim) else agora) - inicio).total_seconds())

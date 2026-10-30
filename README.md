@@ -80,9 +80,21 @@ de `funcoes_glue` ficam em **Regras de avaliação** na barra lateral:
 | 🔄 Em execução | STARTING, RUNNING, WAITING, STOPPING |
 | ✅ Positivo | SUCCEEDED sem erro nem aviso no log |
 
-Ao clicar numa carga aparecem o payload, as chaves ignoradas na comparação, o erro completo, um
-diagnóstico (`classificar_erro_detalhado` + `gerar_diagnostico`) e todas as execuções do dia
-daquela carga. A tabela pode ser filtrada e baixada em CSV.
+## Duas visões
+
+**Última execução por carga** (padrão): uma linha por carga com a situação atual, que é o resultado
+da última execução do dia. A coluna **Histórico do dia** mostra cada execução da carga em ordem
+(ex.: `❌ ✅` = falhou e foi reprocessada com sucesso). A última mostra o resultado operacional e as
+anteriores, o estado na AWS. Cargas sem nenhuma execução também aparecem.
+
+**Todas as execuções do dia**: uma linha por execução, com a posição no dia (`2ª de 3`), a marcação
+de qual é a atual e uma linha do tempo do dia por carga. Nesta visão o log de **todas** as execuções
+é lido (`last_execution=False`), então cada uma tem seu próprio resultado operacional, ao custo de
+mais chamadas ao CloudWatch.
+
+Ao clicar numa linha aparecem o payload, as chaves ignoradas na comparação, o erro completo, um
+diagnóstico (`classificar_erro_detalhado` + `gerar_diagnostico`) e, na visão por carga, todas as
+execuções do dia daquela carga. As duas tabelas podem ser filtradas e baixadas em CSV.
 
 O **Dicionário de erros** (opcional, JSON) traduz trechos de mensagem em categoria, resumo,
 impacto e ação sugerida; [`exemplos/dicionario_erros.json`](exemplos/dicionario_erros.json) serve
@@ -91,7 +103,8 @@ de ponto de partida.
 ## Desempenho
 
 As execuções do dia são listadas uma única vez, e todas as cargas são comparadas em memória.
-As chamadas extras à AWS são só para ler o log da última execução de cada carga. O resultado
+As chamadas extras à AWS são só para ler logs: o da última execução de cada carga, ou o de todas
+as execuções das cargas na visão **Todas as execuções do dia**. O resultado
 fica em cache por 60 s; há atualização automática opcional (1, 5 ou 15 min).
 
 ## Estrutura

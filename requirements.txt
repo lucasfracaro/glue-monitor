@@ -1,0 +1,5 @@
+streamlit>=1.40
+boto3
+pandas
+openpyxl   # payloads em .xlsx
+pyyaml     # payloads em .yaml

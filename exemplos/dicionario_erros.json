@@ -1,0 +1,44 @@
+{
+  "Access Denied": {
+    "erro_categoria": "PERMISSAO",
+    "erro_resumido": "Sem permissão no S3",
+    "impacto_negocio": "Tabela não atualizada",
+    "acao_sugerida": "Revisar a role do job e a policy do bucket/prefixo"
+  },
+  "Path does not exist": {
+    "erro_categoria": "ARQUIVO_NAO_ENCONTRADO",
+    "erro_resumido": "Arquivo de origem não chegou",
+    "impacto_negocio": "Tabela não atualizada",
+    "acao_sugerida": "Confirmar a entrega do arquivo na origem e reprocessar"
+  },
+  "cannot resolve": {
+    "erro_categoria": "COLUNA_INEXISTENTE",
+    "erro_resumido": "Coluna esperada não existe na origem",
+    "impacto_negocio": "Tabela não atualizada",
+    "acao_sugerida": "Comparar o layout recebido com o esperado (espaços no nome da coluna são comuns)"
+  },
+  "target table has": {
+    "erro_categoria": "LAYOUT",
+    "erro_resumido": "Quantidade de colunas diferente da tabela",
+    "impacto_negocio": "Carga pode ter sido parcial",
+    "acao_sugerida": "Revisar o layout do arquivo e o DDL da tabela"
+  },
+  "OutOfMemoryError": {
+    "erro_categoria": "MEMORIA",
+    "erro_resumido": "Falta de memória no Glue",
+    "impacto_negocio": "Tabela não atualizada",
+    "acao_sugerida": "Aumentar workers/worker type ou revisar particionamento"
+  },
+  "timed out": {
+    "erro_categoria": "TIMEOUT",
+    "erro_resumido": "Execução passou do timeout",
+    "impacto_negocio": "Tabela não atualizada",
+    "acao_sugerida": "Revisar volume do dia e o timeout do job"
+  },
+  "stopped by user": {
+    "erro_categoria": "INTERROMPIDO",
+    "erro_resumido": "Execução parada manualmente",
+    "impacto_negocio": "Tabela não atualizada",
+    "acao_sugerida": "Confirmar com o time se precisa reprocessar"
+  }
+}

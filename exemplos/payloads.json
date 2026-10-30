@@ -1,0 +1,14 @@
+[
+  ["Clientes",      {"tablename": "clientes",      "database": "trusted", "tipo_carga": "full"}],
+  ["Contratos",     {"tablename": "contratos",     "database": "trusted", "tipo_carga": "incremental"}],
+  ["Vendas",        {"tablename": "vendas",        "database": "trusted", "tipo_carga": "incremental"}],
+  ["Produtos",      {"tablename": "produtos",      "database": "trusted", "tipo_carga": "full"}],
+  ["Estoque",       {"tablename": "estoque",       "database": "trusted", "tipo_carga": "incremental"}],
+  ["Pagamentos",    {"tablename": "pagamentos",    "database": "trusted", "tipo_carga": "incremental"}],
+  ["Devoluções",    {"tablename": "devolucoes",    "database": "trusted", "tipo_carga": "incremental"}],
+  ["Fornecedores",  {"tablename": "fornecedores",  "database": "trusted", "tipo_carga": "full"}],
+  ["Lojas",         {"tablename": "lojas",         "database": "trusted", "tipo_carga": "full"}],
+  ["Campanhas",     {"tablename": "campanhas",     "database": "trusted", "tipo_carga": "incremental"}],
+  ["Frete",         {"tablename": "frete",         "database": "trusted", "tipo_carga": "incremental"}],
+  ["NPS",           {"tablename": "nps",           "database": "trusted", "tipo_carga": "incremental"}]
+]

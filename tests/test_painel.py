@@ -69,7 +69,7 @@ def test_uma_linha_por_carga_com_todos_os_resultados():
     lista, r = _avaliar()
     quadro = r["quadro"]
     assert len(quadro) == len(lista) and set(quadro["name"]) == {n for n, _ in lista}
-    assert set(quadro["resultado_operacional"]) == set(nucleo.ORDEM_RESULTADOS) - {"INDETERMINADO"}
+    assert set(quadro["resultado_operacional"]) == set(nucleo.ORDEM_RESULTADOS) - {"INDETERMINADO", nucleo.ATRASADO}
     # problemas primeiro
     assert list(quadro["_ordem_resultado"]) == sorted(quadro["_ordem_resultado"])
     sem = quadro[quadro["resultado_operacional"] == nucleo.SEM_EXECUCAO].iloc[0]
@@ -177,6 +177,106 @@ def test_duracao_em_andamento():
                                     "completed_on": pd.NaT}, agora) == "30m00s"
     assert nucleo.duracao_execucao({"execution_time": 125.0}, agora) == "2m05s"
     assert nucleo.duracao_execucao({"started_on": pd.NaT}, agora) == ""
+
+
+def test_campos_opcionais_em_todos_os_formatos():
+    payload = {"tablename": "clientes"}
+    esperado = [{"nome": "Clientes", "payload": payload, "responsavel": "Ana", "horario": "07:30"},
+                {"nome": "Contratos", "payload": {"tablename": "contratos"}, "responsavel": None, "horario": None}]
+    formatos = {
+        "x.json": '[["Clientes", {"tablename": "clientes"}, {"responsavel": "Ana", "horario": "7:30"}], '
+                  '["Contratos", {"tablename": "contratos"}]]',
+        "y.json": '[{"nome": "Clientes", "payload": {"tablename": "clientes"}, "responsavel": "Ana", "horario": "07h30"}, '
+                  '{"nome": "Contratos", "payload": {"tablename": "contratos"}}]',
+        "z.json": '[{"_nome": "Clientes", "tablename": "clientes", "_responsavel": "Ana", "_horario": "0730"}, '
+                  '{"_nome": "Contratos", "tablename": "contratos"}]',
+        "w.json": '[["Clientes", {"tablename": "clientes", "_responsável": "Ana", "_horário": "07:30:00"}], '
+                  '["Contratos", {"tablename": "contratos"}]]',
+        "x.py": 'lista = [("Clientes", {"tablename": "clientes"}, {"Responsavel": "Ana", "hora_execucao": "07:30"}),\n'
+                '         ("Contratos", {"tablename": "contratos"})]',
+        "x.yaml": "- [Clientes, {tablename: clientes}, {responsavel: Ana, horario: '07:30'}]\n"
+                  "- [Contratos, {tablename: contratos}]\n",
+        "x.csv": "nome;tablename;responsavel;horario\nClientes;clientes;Ana;07:30\nContratos;contratos;;\n",
+    }
+    for arquivo, conteudo in formatos.items():
+        assert nucleo.carregar_cargas(conteudo, arquivo) == esperado, arquivo
+        # para funcoes_glue os campos opcionais nao existem
+        assert nucleo.carregar_payloads(conteudo, arquivo) == [("Clientes", payload), ("Contratos", {"tablename": "contratos"})], arquivo
+
+
+def test_horario_invalido():
+    for valor in ("25:00", "7:75", "amanhã"):
+        try:
+            nucleo.carregar_cargas(f'[["A", {{"t": 1}}, {{"horario": "{valor}"}}]]', "x.json")
+        except ValueError as erro:
+            assert "Item 1" in str(erro) and "inválido" in str(erro)
+        else:
+            raise AssertionError(valor)
+    assert nucleo.normalizar_horario(7) == "07:00" and nucleo.normalizar_horario("7h") == "07:00"
+
+
+def _quadro_atraso():
+    import pandas as pd
+
+    linhas = [
+        ("Sem horário", nucleo.SEM_EXECUCAO, None),
+        ("Prevista 08:00", nucleo.SEM_EXECUCAO, "08:00"),
+        ("Prevista 10:00", nucleo.SEM_EXECUCAO, "10:00"),
+        ("Já rodou", "POSITIVO", "06:00"),
+        ("Falhou", "FRACASSO", "06:00"),
+    ]
+    return pd.DataFrame([{"name": n, "resultado_operacional": r, "horario_previsto": h, "_ordem_arquivo": i,
+                          "_ordem_resultado": 0} for i, (n, r, h) in enumerate(linhas)])
+
+
+def test_marcar_atrasos():
+    from datetime import date, datetime
+    from zoneinfo import ZoneInfo
+
+    dia = date(2026, 11, 5)
+    q = nucleo.marcar_atrasos(_quadro_atraso(), dia, datetime(2026, 11, 5, 9, 15)).set_index("name")
+    assert q.loc["Prevista 08:00", "resultado_operacional"] == nucleo.ATRASADO
+    assert q.loc["Prevista 08:00", "observacao"] == "Prevista para 08:00; sem execução até 09:15 (1h15m de atraso)."
+    assert q.loc["Prevista 10:00", "resultado_operacional"] == nucleo.SEM_EXECUCAO
+    assert q.loc["Prevista 10:00", "observacao"] == "Prevista para 10:00."
+    assert q.loc["Sem horário", "resultado_operacional"] == nucleo.SEM_EXECUCAO
+    assert q.loc["Já rodou", "resultado_operacional"] == "POSITIVO"   # com execucao: nao muda
+    assert q.loc["Falhou", "resultado_operacional"] == "FRACASSO"
+    # ordem: fracasso, atraso, ..., sem execucao, positivo
+    ordem = list(nucleo.marcar_atrasos(_quadro_atraso(), dia, datetime(2026, 11, 5, 9, 15))["name"])
+    assert ordem.index("Falhou") < ordem.index("Prevista 08:00") < ordem.index("Sem horário") < ordem.index("Já rodou")
+    # tolerancia: 08:00 + 90 min ainda nao venceu as 09:15
+    q = nucleo.marcar_atrasos(_quadro_atraso(), dia, datetime(2026, 11, 5, 9, 15), tolerancia_min=90).set_index("name")
+    assert q.loc["Prevista 08:00", "resultado_operacional"] == nucleo.SEM_EXECUCAO
+    # exatamente no horario ainda nao e atraso
+    q = nucleo.marcar_atrasos(_quadro_atraso(), dia, datetime(2026, 11, 5, 8, 0)).set_index("name")
+    assert q.loc["Prevista 08:00", "resultado_operacional"] == nucleo.SEM_EXECUCAO
+    # dia anterior: qualquer horario sem execucao esta em atraso
+    q = nucleo.marcar_atrasos(_quadro_atraso(), date(2026, 11, 4), datetime(2026, 11, 5, 0, 5)).set_index("name")
+    assert q.loc["Prevista 10:00", "resultado_operacional"] == nucleo.ATRASADO
+    assert q.loc["Prevista 10:00", "observacao"] == "Prevista para 10:00; não executou no dia."
+    # horario com fuso (como vem do painel)
+    q = nucleo.marcar_atrasos(_quadro_atraso(), dia, datetime(2026, 11, 5, 9, 15, tzinfo=ZoneInfo("America/Sao_Paulo")))
+    assert (q["resultado_operacional"] == nucleo.ATRASADO).sum() == 1
+
+
+def test_atraso_com_avaliacao_real():
+    from datetime import datetime, time
+
+    cargas = nucleo.carregar_cargas((PASTA / "payloads.json").read_bytes(), "payloads.json")
+    lista = [(c["nome"], c["payload"]) for c in cargas]
+    r = nucleo.executar_avaliacao(lista, "meu_job", ONTEM, simulado=True, regiao="sa-east-1")
+    quadro = nucleo.anexar_cargas(r["quadro"], cargas)
+    execucoes = nucleo.anexar_cargas(r["execucoes"], cargas)
+    assert quadro.set_index("name").loc["Clientes", "responsavel"] == "Ana Souza"
+    assert set(execucoes.loc[execucoes["name"] == "Clientes", "responsavel"]) == {"Ana Souza"}
+    marcado = nucleo.marcar_atrasos(quadro, ONTEM, datetime.combine(ONTEM, time(23, 0))).set_index("name")
+    # Fornecedores (previsto 06:00) nao tem execucao no simulador
+    assert marcado.loc["Fornecedores", "resultado_operacional"] == nucleo.ATRASADO
+    assert marcado.loc["Fornecedores", "responsavel"] == "Bruno Lima"
+    assert nucleo.resumo_por_resultado(marcado.reset_index())[nucleo.ATRASADO] == 1
+    # o cache nao e alterado
+    assert nucleo.ATRASADO not in set(r["quadro"]["resultado_operacional"])
 
 
 def test_link_console_e_duracao():

@@ -66,6 +66,30 @@ O arquivo só é lido com `ast.literal_eval`: nada nele é executado. Outros for
 - Sem apelido, o nome é montado com as duas primeiras chaves do payload.
 - Apelidos repetidos ganham o sufixo `(2)`, porque as execuções são agrupadas pelo nome.
 
+### Responsável e horário previsto (opcionais)
+
+Cada carga pode ter um **responsável** e o **horário** em que deveria rodar. Eles não entram na
+comparação com as execuções; servem para exibição e para o status **⏰ Em atraso**.
+
+```json
+[
+  ["Clientes",  {"tablename": "clientes"},  {"responsavel": "Ana Souza", "horario": "06:00"}],
+  ["Contratos", {"tablename": "contratos"}, {"responsavel": "Ana Souza"}],
+  ["Produtos",  {"tablename": "produtos"}]
+]
+```
+
+Também valem `{"nome": ..., "payload": {...}, "responsavel": ..., "horario": ...}`, as chaves
+`_responsavel` e `_horario` dentro do payload, um terceiro item na tupla do `.py` e as colunas
+`responsavel` e `horario` no CSV/Excel. O horário aceita `07:30`, `7:30`, `07h30` ou `0730`.
+
+Uma carga com horário que **não teve nenhuma execução** passa de *Sem execução* para
+**⏰ Em atraso** quando o momento da checagem passa do horário mais a **tolerância de atraso**
+(barra lateral, em minutos). Em dias anteriores, toda carga com horário e sem execução está em
+atraso. Cargas que já rodaram mantêm o resultado da execução.
+
+O responsável aparece nas tabelas, no detalhe e no CSV, e há um filtro por responsável.
+
 Há exemplos em [`exemplos/`](exemplos).
 
 ## Como uma execução é associada a uma carga
@@ -90,6 +114,7 @@ de `funcoes_glue` ficam em **Regras de avaliação** na barra lateral:
 | 🟠 Falso positivo | SUCCEEDED, mas com erro no log |
 | ❔ Indeterminado | status desconhecido ou falha ao ler o log |
 | ⚠️ Alerta | SUCCEEDED com WARN no log |
+| ⏰ Em atraso | sem execução e já passou do horário previsto (+ tolerância) |
 | ⚪ Sem execução | nenhuma execução do dia atendeu o payload |
 | 🔄 Em execução | STARTING, RUNNING, WAITING, STOPPING |
 | ✅ Positivo | SUCCEEDED sem erro nem aviso no log |

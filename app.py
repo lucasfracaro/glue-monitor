@@ -52,6 +52,7 @@ PADROES = {
     "exigir_filtro": True,
     "multiplos": True,
     "chaves_campo": "",
+    "tolerancia_atraso": 0,
     "usar_erros_exemplo": True,
     "intervalo": 0,
     "visao": VISAO_ULTIMA,
@@ -137,6 +138,10 @@ with st.sidebar:
         st.error("Fuso horário inválido.")
         st.stop()
     data_ref = st.date_input("Dia", value=hoje, max_value=hoje, format="DD/MM/YYYY")
+    tolerancia_atraso = st.number_input(
+        "Tolerância de atraso (min)", min_value=0, max_value=720, step=5, key="cfg_tolerancia_atraso",
+        help="Carga com horário previsto no arquivo e sem execução passa a 'Em atraso' "
+             "depois do horário + esta tolerância.")
 
     with st.expander("Regras de avaliação"):
         logs_sucesso = st.checkbox("Ler log das execuções com sucesso", key="cfg_logs_sucesso",
@@ -187,19 +192,20 @@ st.title("🧩 Glue Monitor")
 
 try:
     if arquivo is not None:
-        lista_payloads = nucleo.carregar_payloads(arquivo.getvalue(), arquivo.name)
+        cargas = nucleo.carregar_cargas(arquivo.getvalue(), arquivo.name)
         origem = arquivo.name
         # so guarda arquivos que foram lidos sem erro
         configuracao.salvar_arquivo("payloads", arquivo.name, arquivo.getvalue())
     elif salvo_payloads:
-        lista_payloads = nucleo.carregar_payloads(salvo_payloads["conteudo"], salvo_payloads["nome"])
+        cargas = nucleo.carregar_cargas(salvo_payloads["conteudo"], salvo_payloads["nome"])
         origem = salvo_payloads["nome"]
     else:
-        lista_payloads = nucleo.carregar_payloads(EXEMPLO_PAYLOADS.read_bytes(), EXEMPLO_PAYLOADS.name)
+        cargas = nucleo.carregar_cargas(EXEMPLO_PAYLOADS.read_bytes(), EXEMPLO_PAYLOADS.name)
         origem = f"{EXEMPLO_PAYLOADS.name} (exemplo, envie o seu na barra lateral)"
 except Exception as erro:
     st.error(f"Não consegui ler o arquivo de payloads: {erro}")
     st.stop()
+lista_payloads = [(c["nome"], c["payload"]) for c in cargas]
 
 dicionario_erros = None
 try:
@@ -226,7 +232,7 @@ opcoes = {
 
 CORES = {
     "FRACASSO": "#e5484d", "FALSO_POSITIVO": "#f76b15", "INDETERMINADO": "#8e8c99", "ALERTA": "#f5b400",
-    nucleo.SEM_EXECUCAO: "#b8b8b8", "EM_EXECUCAO": "#3e8ef7", "POSITIVO": "#30a46c",
+    nucleo.ATRASADO: "#ab4aba", nucleo.SEM_EXECUCAO: "#b8b8b8", "EM_EXECUCAO": "#3e8ef7", "POSITIVO": "#30a46c",
 }
 
 
@@ -258,7 +264,8 @@ def texto_erro(linha) -> str:
     resumo, categoria = texto(linha.get("erro_resumido")), texto(linha.get("erro_categoria"))
     if resumo and categoria != "NAO_CLASSIFICADO":
         return resumo
-    return texto(linha.get("detalhe_erro"))
+    # sem erro: mostra a observacao (ex.: atraso em relacao ao horario previsto)
+    return texto(linha.get("detalhe_erro")) or texto(linha.get("observacao"))
 
 
 def rotulo_execucao(linha) -> str:
@@ -267,16 +274,22 @@ def rotulo_execucao(linha) -> str:
     return f"{nucleo.icone_execucao(linha)} {texto(linha.get('status_aws'))}"
 
 
+SEM_RESPONSAVEL = "(sem responsável)"
+
+
 def colunas_visiveis(tabela: pd.DataFrame, colunas: list[str]) -> list[str]:
     """Esconde colunas opcionais que vieram todas vazias."""
-    opcionais = {"Ação sugerida", "Console", "Tipo de erro"}
+    opcionais = {"Ação sugerida", "Console", "Tipo de erro", "Responsável", "Horário previsto"}
     return [c for c in colunas if c not in opcionais or (tabela[c] != "").any()]
 
 
-def filtrar(tabela: pd.DataFrame, resultados: pd.Series, filtro: list, busca: str) -> pd.DataFrame:
+def filtrar(tabela: pd.DataFrame, resultados: pd.Series, filtro: list, busca: str,
+            responsaveis: pd.Series | None = None, filtro_resp: list | None = None) -> pd.DataFrame:
     mascara = pd.Series(True, index=tabela.index)
     if filtro:
         mascara &= resultados.isin(filtro).values
+    if filtro_resp and responsaveis is not None:
+        mascara &= responsaveis.map(texto).replace("", SEM_RESPONSAVEL).isin(filtro_resp).values
     if busca:
         mascara &= tabela["_busca"].str.contains(busca.lower(), regex=False)
     return tabela[mascara]
@@ -285,7 +298,8 @@ def filtrar(tabela: pd.DataFrame, resultados: pd.Series, filtro: list, busca: st
 def texto_busca(df: pd.DataFrame, erros: pd.Series) -> pd.Series:
     return (df["name"].astype(str) + " "
             + df["payload"].map(lambda p: json.dumps(p, ensure_ascii=False, default=str)) + " "
-            + erros.astype(str) + " " + df.get("job_run_id", pd.Series("", index=df.index)).map(texto)).str.lower()
+            + erros.astype(str) + " " + df.get("job_run_id", pd.Series("", index=df.index)).map(texto) + " "
+            + df.get("responsavel", pd.Series("", index=df.index)).map(texto)).str.lower()
 
 
 # --------------------------------------------------------------------------- #
@@ -312,8 +326,11 @@ def painel():
                    "são glue:GetJobRuns, glue:GetJobRun e logs:GetLogEvents. Para testar sem AWS, ligue o modo demonstração.")
         return
 
-    quadro: pd.DataFrame = r["quadro"]
-    execucoes: pd.DataFrame = r["execucoes"]
+    # responsavel/horario vem do arquivo e o atraso depende da hora da checagem:
+    # aplicados fora do cache, sobre copias
+    quadro = nucleo.marcar_atrasos(nucleo.anexar_cargas(r["quadro"], cargas), data_ref,
+                                   r["consultado_em"], int(tolerancia_atraso))
+    execucoes = nucleo.anexar_cargas(r["execucoes"], cargas)
     st.caption(
         f"Job **{nome_job}** · {len(lista_payloads)} cargas de **{origem}** · dia {data_ref:%d/%m/%Y} · "
         f"{r['total_execucoes_dia']} execuções do job no dia, {len(execucoes)} delas das suas cargas · "
@@ -323,13 +340,16 @@ def painel():
     # Indicadores: situacao atual (ultima execucao) de cada carga
     contagem = nucleo.resumo_por_resultado(quadro)
     blocos = [("Cargas", len(quadro))] + [(nucleo.rotulo(k), v) for k, v in contagem.items()]
-    for inicio in (0, 4):
-        for coluna, (titulo, valor) in zip(st.columns(4), blocos[inicio:inicio + 4]):
+    for inicio in (0, 5):
+        for coluna, (titulo, valor) in zip(st.columns(5), blocos[inicio:inicio + 5]):
             coluna.metric(titulo, valor)
 
     problemas = contagem["FRACASSO"] + contagem["FALSO_POSITIVO"] + contagem["INDETERMINADO"]
-    if problemas:
-        st.error(f"{problemas} carga(s) com problema na última execução do dia.")
+    if problemas or contagem[nucleo.ATRASADO]:
+        partes = [f"{problemas} carga(s) com problema na última execução do dia"] if problemas else []
+        if contagem[nucleo.ATRASADO]:
+            partes.append(f"{contagem[nucleo.ATRASADO]} em atraso (sem execução depois do horário previsto)")
+        st.error("; ".join(partes) + ".")
     elif contagem["ALERTA"] or contagem[nucleo.SEM_EXECUCAO]:
         st.warning(f"{contagem['ALERTA']} com alerta no log, {contagem[nucleo.SEM_EXECUCAO]} sem execução no dia.")
     elif contagem["EM_EXECUCAO"]:
@@ -337,22 +357,31 @@ def painel():
     else:
         st.success("Todas as cargas terminaram como POSITIVO.")
 
-    f1, f2 = st.columns([2, 3])
+    responsaveis = sorted({c["responsavel"] for c in cargas if c["responsavel"]})
+    if responsaveis:
+        f1, f3, f2 = st.columns([2, 2, 3])
+        opcoes_resp = responsaveis + ([SEM_RESPONSAVEL] if any(not c["responsavel"] for c in cargas) else [])
+        filtro_resp = f3.multiselect("Responsável", opcoes_resp, placeholder="Todos")
+    else:
+        f1, f2 = st.columns([2, 3])
+        filtro_resp = []
     filtro = f1.multiselect("Resultado", nucleo.ORDEM_RESULTADOS, format_func=nucleo.rotulo, placeholder="Todos")
-    busca = f2.text_input("Buscar", placeholder="nome da carga, valor do payload, erro, run id...")
+    busca = f2.text_input("Buscar", placeholder="nome da carga, responsável, payload, erro, run id...")
     agora = pd.Timestamp(datetime.now(ZoneInfo(fuso))).tz_localize(None)
 
     if todas:
-        visao_todas(quadro, execucoes, filtro, busca, agora, r["total_execucoes_dia"])
+        visao_todas(quadro, execucoes, filtro, busca, agora, r["total_execucoes_dia"], filtro_resp)
     else:
-        visao_ultima(quadro, execucoes, filtro, busca, agora, r["total_execucoes_dia"])
+        visao_ultima(quadro, execucoes, filtro, busca, agora, r["total_execucoes_dia"], filtro_resp)
 
 
-def visao_ultima(quadro, execucoes, filtro, busca, agora, total_execucoes_dia):
+def visao_ultima(quadro, execucoes, filtro, busca, agora, total_execucoes_dia, filtro_resp=()):
     registros = quadro.to_dict("records")
     tabela = pd.DataFrame({
         "Resultado": [nucleo.rotulo(l["resultado_operacional"]) for l in registros],
         "Carga": quadro["name"],
+        "Responsável": quadro["responsavel"].map(texto),
+        "Horário previsto": quadro["horario_previsto"].map(texto),
         "Estado AWS": [texto(l.get("status_aws")) for l in registros],
         "Início": [hora(l.get("started_on")) for l in registros],
         "Fim": [hora(l.get("completed_on")) for l in registros],
@@ -366,9 +395,10 @@ def visao_ultima(quadro, execucoes, filtro, busca, agora, total_execucoes_dia):
     })
     tabela["_posicao"] = range(len(tabela))
     tabela["_busca"] = texto_busca(quadro, tabela["Erro"])
-    tabela = filtrar(tabela, quadro["resultado_operacional"], filtro, busca)
+    tabela = filtrar(tabela, quadro["resultado_operacional"], filtro, busca, quadro["responsavel"], filtro_resp)
 
-    colunas = colunas_visiveis(tabela, ["Resultado", "Carga", "Estado AWS", "Início", "Fim", "Duração",
+    colunas = colunas_visiveis(tabela, ["Resultado", "Carga", "Responsável", "Horário previsto", "Estado AWS",
+                                        "Início", "Fim", "Duração",
                                         "Execuções no dia", "Histórico do dia", "Tipo de erro", "Erro",
                                         "Ação sugerida", "Console"])
     selecao = st.dataframe(
@@ -391,10 +421,23 @@ def visao_ultima(quadro, execucoes, filtro, busca, agora, total_execucoes_dia):
     baixar(tabela, colunas, "ultima")
 
 
-def visao_todas(quadro, execucoes, filtro, busca, agora, total_execucoes_dia):
-    sem_execucao = quadro.loc[quadro["resultado_operacional"] == nucleo.SEM_EXECUCAO, "name"].tolist()
+def visao_todas(quadro, execucoes, filtro, busca, agora, total_execucoes_dia, filtro_resp=()):
+    def descricao(linha):
+        extras = [texto(linha.get("responsavel")), f"previsto {linha['horario_previsto']}" if texto(linha.get("horario_previsto")) else ""]
+        extras = [e for e in extras if e]
+        return linha["name"] + (f" ({', '.join(extras)})" if extras else "")
+    registros_quadro = quadro.to_dict("records")
+    atrasadas = [descricao(l) for l in registros_quadro if l["resultado_operacional"] == nucleo.ATRASADO]
+    sem_execucao = [descricao(l) for l in registros_quadro if l["resultado_operacional"] == nucleo.SEM_EXECUCAO]
+    def avisos():
+        if atrasadas:
+            st.caption("⏰ Em atraso: " + "; ".join(atrasadas))
+        if sem_execucao:
+            st.caption("⚪ Sem execução no dia: " + "; ".join(sem_execucao))
+
     if execucoes.empty:
         st.info("Nenhuma execução das cargas neste dia.")
+        avisos()
         return
 
     # mesma ordem das cargas na visao resumida (problemas primeiro); dentro da carga, mais recente primeiro
@@ -408,6 +451,7 @@ def visao_todas(quadro, execucoes, filtro, busca, agora, total_execucoes_dia):
     tabela = pd.DataFrame({
         "Resultado": [rotulo_execucao(l) for l in registros],
         "Carga": df["name"],
+        "Responsável": df["responsavel"].map(texto),
         "Nº": [f"{l['ordem_no_dia']}ª de {l['total_no_dia']}" for l in registros],
         "Atual": df["atual"],
         "Estado AWS": [texto(l.get("status_aws")) for l in registros],
@@ -421,9 +465,9 @@ def visao_todas(quadro, execucoes, filtro, busca, agora, total_execucoes_dia):
     })
     tabela["_posicao"] = range(len(tabela))
     tabela["_busca"] = texto_busca(df, tabela["Erro"])
-    tabela = filtrar(tabela, df["resultado_operacional"], filtro, busca)
+    tabela = filtrar(tabela, df["resultado_operacional"], filtro, busca, df["responsavel"], filtro_resp)
 
-    colunas = colunas_visiveis(tabela, ["Resultado", "Carga", "Nº", "Atual", "Estado AWS", "Início", "Fim",
+    colunas = colunas_visiveis(tabela, ["Resultado", "Carga", "Responsável", "Nº", "Atual", "Estado AWS", "Início", "Fim",
                                         "Duração", "Tipo de erro", "Erro", "Ação sugerida", "Console"])
     selecao = st.dataframe(
         tabela, hide_index=True, column_order=colunas, key="tabela_todas",
@@ -434,8 +478,7 @@ def visao_todas(quadro, execucoes, filtro, busca, agora, total_execucoes_dia):
             "Console": st.column_config.LinkColumn(display_text="abrir ↗"),
         },
     )
-    if sem_execucao:
-        st.caption("Sem execução no dia: " + ", ".join(sem_execucao))
+    avisos()
     linhas = [i for i in (selecao.selection.rows if selecao else []) if i < len(tabela)]
     if linhas:
         detalhe_execucao(df.iloc[int(tabela.iloc[linhas[0]]["_posicao"])], agora)
@@ -518,7 +561,12 @@ def detalhe_carga(linha: pd.Series, execucoes: pd.DataFrame, total_execucoes_dia
                 st.markdown("**Chaves ignoradas na comparação**")
                 st.json(linha["filtros_ignorados"])
         with c2:
-            if linha["resultado_operacional"] == nucleo.SEM_EXECUCAO:
+            for campo, titulo in (("responsavel", "Responsável"), ("horario_previsto", "Horário previsto")):
+                if texto(linha.get(campo)):
+                    st.markdown(f"**{titulo}:** {linha[campo]}")
+            if texto(linha.get("observacao")):
+                st.markdown(f"**Situação:** {linha['observacao']}")
+            if linha["resultado_operacional"] in (nucleo.SEM_EXECUCAO, nucleo.ATRASADO):
                 st.markdown(
                     f"Nenhuma das **{total_execucoes_dia}** execuções do job neste dia bateu com o payload. "
                     "Confira se os valores estão iguais aos argumentos do job (sem o `--`)."
@@ -550,6 +598,8 @@ def detalhe_execucao(linha: pd.Series, agora):
             st.markdown("**Payload**")
             st.json(linha["payload"])
         with c2:
+            if texto(linha.get("responsavel")):
+                st.markdown(f"**Responsável:** {linha['responsavel']}")
             info_execucao(linha)
             st.markdown(f"**Início:** {hora(linha.get('started_on'))} · **Fim:** {hora(linha.get('completed_on')) or 'em andamento'}"
                         f" · **Duração:** {nucleo.duracao_execucao(linha, agora)}")

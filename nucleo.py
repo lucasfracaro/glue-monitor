@@ -11,7 +11,7 @@ import io
 import json
 import re
 import sys
-from datetime import date
+from datetime import date, datetime, time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -26,11 +26,13 @@ import funcoes_glue as fg  # noqa: E402
 from utils_gerais import valor_vazio  # noqa: E402
 
 SEM_EXECUCAO = "SEM_EXECUCAO"
+ATRASADO = "ATRASADO"  # sem execucao depois do horario previsto
 
 # ordem de exibicao: o que exige atencao primeiro
 RESULTADOS = {
     "FRACASSO": ("❌", "Fracasso"),
     "FALSO_POSITIVO": ("🟠", "Falso positivo"),
+    ATRASADO: ("⏰", "Em atraso"),
     "INDETERMINADO": ("❔", "Indeterminado"),
     "ALERTA": ("⚠️", "Alerta"),
     SEM_EXECUCAO: ("⚪", "Sem execução"),
@@ -39,6 +41,9 @@ RESULTADOS = {
 }
 ORDEM_RESULTADOS = list(RESULTADOS)
 CHAVES_NOME = ("_nome", "nome", "name")
+# campos opcionais de cada carga (nao entram na comparacao com as execucoes)
+CHAVES_RESPONSAVEL = ("_responsavel", "responsavel", "responsável", "_responsável", "owner")
+CHAVES_HORARIO = ("_horario", "horario", "horário", "_horário", "hora_execucao", "horario_execucao", "horario_previsto")
 
 
 def rotulo(resultado: str) -> str:
@@ -52,6 +57,15 @@ def rotulo(resultado: str) -> str:
 def carregar_payloads(conteudo: bytes | str, nome_arquivo: str) -> list[tuple[str, dict]]:
     """Le o arquivo e devolve [(nome, payload), ...], no formato de funcoes_glue.
 
+    Os campos opcionais (responsavel, horario) ficam de fora; use carregar_cargas
+    para recebe-los.
+    """
+    return [(c["nome"], c["payload"]) for c in carregar_cargas(conteudo, nome_arquivo)]
+
+
+def carregar_cargas(conteudo: bytes | str, nome_arquivo: str) -> list[dict]:
+    """Le o arquivo e devolve [{"nome", "payload", "responsavel", "horario"}, ...].
+
     Formatos aceitos:
       .py/.txt  a mesma lista que voce ja usa no codigo, ex.:
                 lista_payloads = [("Clientes", {"tablename": "clientes"}), ...]
@@ -62,6 +76,12 @@ def carregar_payloads(conteudo: bytes | str, nome_arquivo: str) -> list[tuple[st
       .yaml     mesmos formatos do JSON
       .csv/.xlsx  uma linha por carga; coluna "nome" + uma coluna por chave do payload
                   (celulas vazias sao ignoradas)
+
+    Campos opcionais de cada carga (responsavel e horario, ex. "07:30"):
+      * terceiro item da lista/tupla: ["Clientes", {...}, {"responsavel": "Ana", "horario": "07:30"}]
+      * chaves ao lado de "payload": {"nome": ..., "payload": {...}, "responsavel": ..., "horario": ...}
+      * chaves com "_" dentro do payload: {"tablename": ..., "_responsavel": ..., "_horario": ...}
+      * colunas "responsavel" e "horario" no CSV/Excel
     """
     extensao = nome_arquivo.lower().rsplit(".", 1)[-1]
     if extensao == "xlsx":
@@ -107,16 +127,52 @@ def _literal_python(texto: str):
 
 def _tabela_para_itens(df: pd.DataFrame) -> list[dict]:
     df.columns = [str(c).strip() for c in df.columns]
-    coluna_nome = next((c for c in df.columns if c.lower() in CHAVES_NOME), None)
+    minusculas = {c: c.lower() for c in df.columns}
+    coluna_nome = next((c for c in df.columns if minusculas[c] in CHAVES_NOME), None)
+    coluna_resp = next((c for c in df.columns if minusculas[c] in CHAVES_RESPONSAVEL), None)
+    coluna_hora = next((c for c in df.columns if minusculas[c] in CHAVES_HORARIO), None)
+    especiais = {coluna_nome, coluna_resp, coluna_hora}
     itens = []
     for _, linha in df.iterrows():
-        payload = {c: str(v).strip() for c, v in linha.items() if c != coluna_nome and not valor_vazio(v)}
+        payload = {c: str(v).strip() for c, v in linha.items() if c not in especiais and not valor_vazio(v)}
         if payload:
-            itens.append({"nome": linha[coluna_nome] if coluna_nome else None, "payload": payload})
+            itens.append({
+                "nome": linha[coluna_nome] if coluna_nome else None,
+                "payload": payload,
+                "responsavel": linha[coluna_resp] if coluna_resp else None,
+                "horario": linha[coluna_hora] if coluna_hora else None,
+            })
     return itens
 
 
-def _normalizar(dados) -> list[tuple[str, dict]]:
+def normalizar_horario(valor) -> str | None:
+    """'7:30', '07h30', '0730', '07:30:00', 7 -> '07:30'. Vazio -> None."""
+    if valor_vazio(valor):
+        return None
+    if isinstance(valor, (int, float)) and not isinstance(valor, bool) and float(valor).is_integer():
+        valor = f"{int(valor)}:00"
+    texto = str(valor).strip()
+    m = re.fullmatch(r"(\d{1,2})\s*[:hH]\s*(\d{2})(?::\d{2})?\s*[hH]?|(\d{2})(\d{2})|(\d{1,2})\s*[hH]?", texto)
+    if not m:
+        raise ValueError(f"horário '{valor}' inválido (use HH:MM, ex. 07:30)")
+    hora, minuto = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4)) if m.group(3) else (m.group(5), "0")
+    hora, minuto = int(hora), int(minuto)
+    if hora > 23 or minuto > 59:
+        raise ValueError(f"horário '{valor}' inválido (use HH:MM, ex. 07:30)")
+    return f"{hora:02d}:{minuto:02d}"
+
+
+def _extrair(dicionario: dict, chaves: tuple) -> object:
+    """Remove e devolve o primeiro valor preenchido entre as chaves (sem diferenciar maiusculas)."""
+    valor = None
+    for chave in [k for k in dicionario if str(k).lower() in chaves]:
+        encontrado = dicionario.pop(chave)
+        if valor is None and not valor_vazio(encontrado):
+            valor = encontrado
+    return valor
+
+
+def _normalizar(dados) -> list[dict]:
     if isinstance(dados, dict):
         lista = next((dados[k] for k in ("lista_payloads", "payloads", "dicionarios") if isinstance(dados.get(k), list)), None)
         if lista is not None:
@@ -128,19 +184,36 @@ def _normalizar(dados) -> list[tuple[str, dict]]:
     if not isinstance(dados, (list, tuple)) or not dados:
         raise ValueError("O arquivo precisa conter uma lista de payloads.")
 
-    saida: list[tuple[str, dict]] = []
+    saida: list[dict] = []
     vistos: dict[str, int] = {}
     for pos, item in enumerate(dados):
-        if isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[1], dict):
-            nome, payload = item
+        extras: dict = {}
+        if isinstance(item, (list, tuple)) and len(item) in (2, 3) and isinstance(item[1], dict) \
+                and (len(item) == 2 or isinstance(item[2], dict)):
+            nome, payload = item[0], dict(item[1])
+            extras = dict(item[2]) if len(item) == 3 else {}
         elif isinstance(item, dict) and isinstance(item.get("payload"), dict):
             nome = next((item[k] for k in CHAVES_NOME if not valor_vazio(item.get(k))), None)
-            payload = item["payload"]
+            payload = dict(item["payload"])
+            extras = {k: v for k, v in item.items() if k != "payload" and k not in CHAVES_NOME}
         elif isinstance(item, dict):
             nome = item.get("_nome")
             payload = {k: v for k, v in item.items() if k != "_nome"}
         else:
-            raise ValueError(f"Item {pos + 1} inválido: use (nome, payload), {{'nome':..., 'payload':...}} ou um dicionário.")
+            raise ValueError(f"Item {pos + 1} inválido: use (nome, payload), (nome, payload, extras), "
+                             "{'nome':..., 'payload':...} ou um dicionário.")
+
+        # campos opcionais: nos extras ou com "_" dentro do payload (nunca entram na comparacao)
+        responsavel = _extrair(extras, CHAVES_RESPONSAVEL)
+        horario = _extrair(extras, CHAVES_HORARIO)
+        no_payload_resp = _extrair(payload, tuple(k for k in CHAVES_RESPONSAVEL if k.startswith("_")))
+        no_payload_hora = _extrair(payload, tuple(k for k in CHAVES_HORARIO if k.startswith("_")))
+        responsavel = responsavel if responsavel is not None else no_payload_resp
+        horario = horario if horario is not None else no_payload_hora
+        try:
+            horario = normalizar_horario(horario)
+        except ValueError as erro:
+            raise ValueError(f"Item {pos + 1}: {erro}") from None
 
         # funcoes_glue compara com os argumentos ja sem "--"
         payload = {(k[2:] if str(k).startswith("--") else str(k)): v for k, v in payload.items()}
@@ -155,7 +228,12 @@ def _normalizar(dados) -> list[tuple[str, dict]]:
             nome = f"{nome} ({vistos[nome]})"
         else:
             vistos[nome] = 1
-        saida.append((nome, payload))
+        saida.append({
+            "nome": nome,
+            "payload": payload,
+            "responsavel": None if valor_vazio(responsavel) else str(responsavel).strip(),
+            "horario": horario,
+        })
     return saida
 
 
@@ -378,7 +456,53 @@ def montar_quadro(df_ultimas, lista_payloads, execucoes, fuso, regiao, nome_job)
             quadro[coluna] = pd.NaT
         quadro[coluna] = pd.to_datetime(quadro[coluna])
     quadro["_ordem_resultado"] = quadro["resultado_operacional"].map(
-        lambda x: ORDEM_RESULTADOS.index(x) if x in ORDEM_RESULTADOS else 2)
+        lambda x: ORDEM_RESULTADOS.index(x) if x in ORDEM_RESULTADOS else ORDEM_RESULTADOS.index("INDETERMINADO"))
+    return quadro.sort_values(["_ordem_resultado", "_ordem_arquivo"]).reset_index(drop=True)
+
+
+def anexar_cargas(df: pd.DataFrame, cargas: list[dict]) -> pd.DataFrame:
+    """Copia de df com as colunas responsavel e horario_previsto de cada carga (pelo name)."""
+    por_nome = {c["nome"]: c for c in cargas}
+    df = df.copy()
+    nomes = df["name"] if "name" in df else pd.Series([], dtype=object)
+    df["responsavel"] = nomes.map(lambda n: por_nome.get(n, {}).get("responsavel"))
+    df["horario_previsto"] = nomes.map(lambda n: por_nome.get(n, {}).get("horario"))
+    return df
+
+
+def marcar_atrasos(quadro: pd.DataFrame, data_referencia: date, verificado_em: datetime,
+                   tolerancia_min: int = 0) -> pd.DataFrame:
+    """Carga sem execucao cujo horario previsto (+ tolerancia) ja passou vira ATRASADO.
+
+    verificado_em: momento da checagem, no fuso do painel. Em dias anteriores ao da
+    checagem, qualquer carga com horario e sem execucao esta em atraso.
+    """
+    quadro = quadro.copy()
+    if "horario_previsto" not in quadro:
+        quadro["horario_previsto"] = None
+    quadro["observacao"] = None
+    agora = pd.Timestamp(verificado_em)
+    if agora.tzinfo is not None:
+        agora = agora.tz_localize(None)
+
+    for i, linha in quadro.iterrows():
+        horario = linha.get("horario_previsto")
+        if linha["resultado_operacional"] != SEM_EXECUCAO or valor_vazio(horario):
+            continue
+        hora, minuto = map(int, horario.split(":"))
+        previsto = pd.Timestamp(datetime.combine(data_referencia, time(hora, minuto)))
+        if data_referencia < agora.date():
+            quadro.at[i, "resultado_operacional"] = ATRASADO
+            quadro.at[i, "observacao"] = f"Prevista para {horario}; não executou no dia."
+        elif agora > previsto + pd.Timedelta(minutes=tolerancia_min):
+            atraso = formatar_duracao((agora - previsto).total_seconds())
+            quadro.at[i, "resultado_operacional"] = ATRASADO
+            quadro.at[i, "observacao"] = f"Prevista para {horario}; sem execução até {agora:%H:%M} ({atraso} de atraso)."
+        else:
+            quadro.at[i, "observacao"] = f"Prevista para {horario}."
+
+    quadro["_ordem_resultado"] = quadro["resultado_operacional"].map(
+        lambda x: ORDEM_RESULTADOS.index(x) if x in ORDEM_RESULTADOS else ORDEM_RESULTADOS.index("INDETERMINADO"))
     return quadro.sort_values(["_ordem_resultado", "_ordem_arquivo"]).reset_index(drop=True)
 
 

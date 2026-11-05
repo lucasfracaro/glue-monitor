@@ -23,6 +23,7 @@ PASTA = Path(__file__).resolve().parent
 if str(PASTA) not in sys.path:
     sys.path.insert(0, str(PASTA))
 
+import configuracao  # noqa: E402
 import nucleo  # noqa: E402
 
 st.set_page_config(page_title="Glue Monitor", page_icon="🧩", layout="wide")
@@ -30,6 +31,82 @@ st.set_page_config(page_title="Glue Monitor", page_icon="🧩", layout="wide")
 EXEMPLO_PAYLOADS = PASTA / "exemplos" / "payloads.json"
 EXEMPLO_ERROS = PASTA / "exemplos" / "dicionario_erros.json"
 
+
+VISAO_ULTIMA = "Última execução por carga"
+VISAO_TODAS = "Todas as execuções do dia"
+INTERVALOS = [0, 60, 300, 900]
+
+# --------------------------------------------------------------------------- #
+# Configuracao salva: os widgets usam as chaves cfg_<nome> do session_state,
+# preenchidas uma vez por sessao com o que foi salvo (ou com o padrao).
+# --------------------------------------------------------------------------- #
+PADROES = {
+    "demo": os.getenv("GLUE_MONITOR_DEMO") == "1",
+    "nome_job": os.getenv("GLUE_JOB_NAME", "meu_job"),
+    "regiao": os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "us-east-1")),
+    "perfil": os.getenv("AWS_PROFILE", ""),
+    "fuso": "America/Sao_Paulo",
+    "logs_sucesso": True,
+    "logs_falha": True,
+    "ignorar_vazias": True,
+    "exigir_filtro": True,
+    "multiplos": True,
+    "chaves_campo": "",
+    "usar_erros_exemplo": True,
+    "intervalo": 0,
+    "visao": VISAO_ULTIMA,
+}
+VALORES_VALIDOS = {"intervalo": INTERVALOS, "visao": [VISAO_ULTIMA, VISAO_TODAS]}
+
+
+def iniciar_configuracao():
+    """Preenche as chaves que faltam com o valor salvo (ou o padrao).
+
+    Roda a cada execucao: o Streamlit apaga a chave de um widget que deixou de ser
+    desenhado numa rodada, e assim ela volta com o valor salvo, nao com o padrao.
+    """
+    faltando = [chave for chave in PADROES if f"cfg_{chave}" not in st.session_state]
+    salvo = configuracao.carregar() if faltando else {}
+    for chave in faltando:
+        padrao = PADROES[chave]
+        valor = salvo.get(chave, padrao)
+        if type(valor) is not type(padrao) or valor not in VALORES_VALIDOS.get(chave, [valor]):
+            valor = padrao  # valor salvo invalido: volta ao padrao
+        st.session_state[f"cfg_{chave}"] = valor
+    st.session_state.setdefault("upload_rodada", 0)
+
+
+def salvar_configuracao(**extra):
+    valores = {chave: st.session_state.get(f"cfg_{chave}", PADROES[chave]) for chave in PADROES}
+    try:
+        configuracao.salvar({**valores, **extra})
+    except OSError as erro:
+        st.session_state["cfg_erro"] = str(erro)
+
+
+def esquecer_arquivo(tipo):
+    configuracao.remover_arquivo(tipo)
+    st.session_state["upload_rodada"] += 1  # recria o campo de upload vazio
+
+
+def restaurar_padroes():
+    configuracao.limpar()
+    for chave in [c for c in st.session_state if c.startswith("cfg_")]:
+        del st.session_state[chave]
+    st.session_state["upload_rodada"] = st.session_state.get("upload_rodada", 0) + 1
+    st.cache_data.clear()
+
+
+def aviso_arquivo_salvo(salvo, tipo, rotulo):
+    st.caption(f"📎 Usando **{salvo['nome']}**, salvo em {salvo['salvo_em']:%d/%m/%Y %H:%M}. "
+               f"Envie outro {rotulo} para substituir.")
+    st.button("Esquecer este arquivo", key=f"esquecer_{tipo}", on_click=esquecer_arquivo, args=(tipo,))
+
+
+iniciar_configuracao()
+rodada_upload = st.session_state["upload_rodada"]
+salvo_payloads = configuracao.arquivo_salvo("payloads")
+salvo_erros = configuracao.arquivo_salvo("erros")
 
 # --------------------------------------------------------------------------- #
 # Barra lateral
@@ -41,16 +118,19 @@ with st.sidebar:
         type=["py", "txt", "json", "jsonl", "yaml", "yml", "csv", "xlsx"],
         help="A mesma lista [(nome, payload), ...] que você passa para "
              "avaliar_job_glue_por_lista_payloads_nomeados, em .py, JSON, YAML, CSV ou Excel.",
+        key=f"upload_payloads_{rodada_upload}",
     )
+    if arquivo is None and salvo_payloads:
+        aviso_arquivo_salvo(salvo_payloads, "payloads", "arquivo")
 
     st.subheader("Job e AWS")
-    demo = st.toggle("Modo demonstração (sem AWS)", value=os.getenv("GLUE_MONITOR_DEMO") == "1")
-    nome_job = st.text_input("Glue Job", os.getenv("GLUE_JOB_NAME", "meu_job"))
-    regiao = st.text_input("Região", os.getenv("AWS_REGION", os.getenv("AWS_DEFAULT_REGION", "us-east-1")))
-    perfil = st.text_input("Perfil AWS (opcional)", os.getenv("AWS_PROFILE", ""), disabled=demo)
+    demo = st.toggle("Modo demonstração (sem AWS)", key="cfg_demo")
+    nome_job = st.text_input("Glue Job", key="cfg_nome_job")
+    regiao = st.text_input("Região", key="cfg_regiao")
+    perfil = st.text_input("Perfil AWS (opcional)", key="cfg_perfil", disabled=demo)
 
     st.subheader("Data")
-    fuso = st.text_input("Fuso horário", "America/Sao_Paulo")
+    fuso = st.text_input("Fuso horário", key="cfg_fuso")
     try:
         hoje = datetime.now(ZoneInfo(fuso)).date()
     except Exception:
@@ -59,29 +139,45 @@ with st.sidebar:
     data_ref = st.date_input("Dia", value=hoje, max_value=hoje, format="DD/MM/YYYY")
 
     with st.expander("Regras de avaliação"):
-        logs_sucesso = st.checkbox("Ler log das execuções com sucesso", True,
+        logs_sucesso = st.checkbox("Ler log das execuções com sucesso", key="cfg_logs_sucesso",
                                    help="Detecta FALSO_POSITIVO e ALERTA. Faz uma leitura no CloudWatch por carga.")
-        logs_falha = st.checkbox("Ler log das falhas sem ErrorMessage", True)
-        ignorar_vazias = st.checkbox("Ignorar chaves ausentes na execução", True,
+        logs_falha = st.checkbox("Ler log das falhas sem ErrorMessage", key="cfg_logs_falha")
+        ignorar_vazias = st.checkbox("Ignorar chaves ausentes na execução", key="cfg_ignorar_vazias",
                                      help="ignorar_chaves_vazias_no_run")
-        exigir_filtro = st.checkbox("Exigir ao menos uma chave comparada", True,
+        exigir_filtro = st.checkbox("Exigir ao menos uma chave comparada", key="cfg_exigir_filtro",
                                     help="exigir_ao_menos_um_filtro_aplicado")
-        multiplos = st.checkbox("Permitir uma execução em mais de uma carga", True,
+        multiplos = st.checkbox("Permitir uma execução em mais de uma carga", key="cfg_multiplos",
                                 help="permitir_multiplos_matches")
-        chaves_campo = st.text_input("Comparar só estas chaves (opcional)", "",
+        chaves_campo = st.text_input("Comparar só estas chaves (opcional)", key="cfg_chaves_campo",
                                      help="Separadas por vírgula. Vazio = todas as chaves preenchidas do payload.")
 
     with st.expander("Dicionário de erros (opcional)"):
         arquivo_erros = st.file_uploader(
             "JSON {trecho_da_mensagem: {erro_categoria, erro_resumido, impacto_negocio, acao_sugerida}}",
             type=["json"],
+            key=f"upload_erros_{rodada_upload}",
         )
-        usar_erros_exemplo = st.checkbox("Usar o dicionário de exemplo", value=arquivo_erros is None)
+        if arquivo_erros is None and salvo_erros:
+            aviso_arquivo_salvo(salvo_erros, "erros", "dicionário")
+        usar_erros_exemplo = st.checkbox(
+            "Usar o dicionário de exemplo quando não houver um enviado", key="cfg_usar_erros_exemplo",
+            disabled=arquivo_erros is not None or salvo_erros is not None,
+        )
 
-    intervalo = st.selectbox("Atualização automática", [0, 60, 300, 900],
+    intervalo = st.selectbox("Atualização automática", INTERVALOS, key="cfg_intervalo",
                              format_func=lambda s: "Desligada" if s == 0 else f"A cada {s // 60} min")
     if st.button("🔄 Atualizar agora", type="primary"):
         st.cache_data.clear()
+
+    with st.expander("Configuração salva"):
+        st.caption(f"Suas escolhas e os arquivos enviados ficam em `{configuracao.diretorio()}` "
+                   "e voltam na próxima vez que você abrir o painel. Credenciais não são salvas, "
+                   "só o nome do perfil AWS.")
+        st.button("Restaurar padrões", on_click=restaurar_padroes)
+        if st.session_state.get("cfg_erro"):
+            st.warning(f"Não foi possível salvar a configuração: {st.session_state['cfg_erro']}")
+
+salvar_configuracao()
 
 
 # --------------------------------------------------------------------------- #
@@ -93,6 +189,11 @@ try:
     if arquivo is not None:
         lista_payloads = nucleo.carregar_payloads(arquivo.getvalue(), arquivo.name)
         origem = arquivo.name
+        # so guarda arquivos que foram lidos sem erro
+        configuracao.salvar_arquivo("payloads", arquivo.name, arquivo.getvalue())
+    elif salvo_payloads:
+        lista_payloads = nucleo.carregar_payloads(salvo_payloads["conteudo"], salvo_payloads["nome"])
+        origem = salvo_payloads["nome"]
     else:
         lista_payloads = nucleo.carregar_payloads(EXEMPLO_PAYLOADS.read_bytes(), EXEMPLO_PAYLOADS.name)
         origem = f"{EXEMPLO_PAYLOADS.name} (exemplo, envie o seu na barra lateral)"
@@ -104,6 +205,9 @@ dicionario_erros = None
 try:
     if arquivo_erros is not None:
         dicionario_erros = json.loads(arquivo_erros.getvalue().decode("utf-8-sig"))
+        configuracao.salvar_arquivo("erros", arquivo_erros.name, arquivo_erros.getvalue())
+    elif salvo_erros:
+        dicionario_erros = json.loads(salvo_erros["conteudo"].decode("utf-8-sig"))
     elif usar_erros_exemplo and EXEMPLO_ERROS.exists():
         dicionario_erros = json.loads(EXEMPLO_ERROS.read_text("utf-8"))
 except Exception as erro:
@@ -119,8 +223,6 @@ opcoes = {
 }
 
 
-VISAO_ULTIMA = "Última execução por carga"
-VISAO_TODAS = "Todas as execuções do dia"
 
 CORES = {
     "FRACASSO": "#e5484d", "FALSO_POSITIVO": "#f76b15", "INDETERMINADO": "#8e8c99", "ALERTA": "#f5b400",
@@ -191,10 +293,11 @@ def texto_busca(df: pd.DataFrame, erros: pd.Series) -> pd.Series:
 # --------------------------------------------------------------------------- #
 def painel():
     visao = st.radio(
-        "Visão", [VISAO_ULTIMA, VISAO_TODAS], horizontal=True, key="visao", label_visibility="collapsed",
+        "Visão", [VISAO_ULTIMA, VISAO_TODAS], horizontal=True, key="cfg_visao", label_visibility="collapsed",
         help="Todas as execuções lê o log de cada execução do dia (mais chamadas ao CloudWatch).",
     )
     todas = visao == VISAO_TODAS
+    salvar_configuracao(visao=visao)  # o fragmento roda sozinho ao trocar a visao
     rodada = int(time.time() // intervalo) if intervalo else 0
     try:
         with st.spinner(f"Avaliando {len(lista_payloads)} cargas do job {nome_job}..."):

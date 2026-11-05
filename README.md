@@ -28,6 +28,20 @@ Permissões necessárias: `glue:GetJobRuns`, `glue:GetJobRun` e `logs:GetLogEven
 
 Valores padrão por variável de ambiente: `GLUE_JOB_NAME`, `AWS_REGION`, `AWS_PROFILE`.
 
+## Configuração salva
+
+O painel guarda o que você escolheu na barra lateral (job, região, perfil AWS, fuso, regras de
+avaliação, atualização automática e visão) e uma cópia do arquivo de cargas e do dicionário de
+erros enviados. Na próxima vez que abrir, tudo volta como estava.
+
+- Fica em `~/.config/glue-monitor/` (ou `$XDG_CONFIG_HOME/glue-monitor`, ou o diretório em
+  `GLUE_MONITOR_CONFIG_DIR`).
+- Credenciais não são salvas, só o nome do perfil AWS.
+- Um arquivo novo só substitui o salvo se for lido sem erro.
+- **Esquecer este arquivo** apaga a cópia salva; **Restaurar padrões** (em *Configuração salva*,
+  na barra lateral) apaga tudo e volta aos valores iniciais.
+- O dia consultado não é salvo: o painel sempre abre no dia de hoje.
+
 ## Arquivo de cargas
 
 O apelido de cada carga é o nome que aparece no painel. O jeito mais simples é subir o mesmo
@@ -111,6 +125,7 @@ fica em cache por 60 s; há atualização automática opcional (1, 5 ou 15 min).
 
 ```
 app.py          a tela (Streamlit)
+configuracao.py configuração salva entre uma abertura e outra
 nucleo.py       leitura do arquivo de cargas, chamada a funcoes_glue, montagem do quadro
 simulador.py    imita os clientes glue e logs do boto3 (modo demonstração e testes)
 vendor/         funcoes_glue.py, datas.py e utils_gerais.py do aws-data-utils
